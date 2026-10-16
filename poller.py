@@ -6,10 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-# Важно: подключаем системное хранилище сертификатов ДО requests.
-import truststore
-truststore.inject_into_ssl()
-
+import certifi
 import requests
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
@@ -34,10 +31,15 @@ EUROPE_API_URL = os.getenv(
 ).strip()
 
 SHARED_SECRET = os.getenv("SHARED_SECRET", "").strip()
+
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 
-# Тариф ВТБ: до 500 000 рублей.
 TARGET_TOOLTIP = "до 500000.00"
+
+CERTS_DIR = BASE_DIR / "certs"
+ROOT_CERT = CERTS_DIR / "russian_trusted_root_ca_pem.crt"
+SUB_CERT = CERTS_DIR / "russian_trusted_sub_ca_pem.crt"
+CA_BUNDLE = CERTS_DIR / "combined_ca.pem"
 
 
 # =========================================================
@@ -53,51 +55,110 @@ log = logging.getLogger(__name__)
 
 
 # =========================================================
+# BUILD CA BUNDLE
+# =========================================================
+
+def build_ca_bundle():
+    """
+    Собирает стандартный набор CA certifi и российские
+    сертификаты в единый файл.
+    """
+
+    CERTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for cert in (ROOT_CERT, SUB_CERT):
+        if not cert.is_file():
+            raise FileNotFoundError(
+                f"Не найден сертификат: {cert}. "
+                "Помести оба сертификата в папку /app/certs/."
+            )
+
+        if cert.stat().st_size == 0:
+            raise ValueError(f"Файл сертификата пустой: {cert}")
+
+        content = cert.read_bytes()
+
+        if b"-----BEGIN CERTIFICATE-----" not in content:
+            raise ValueError(
+                f"Файл {cert.name} не похож на PEM-сертификат. "
+                "Проверь формат скачанного файла."
+            )
+
+    temp_bundle = CA_BUNDLE.with_suffix(".tmp")
+
+    with open(temp_bundle, "wb") as output:
+        with open(certifi.where(), "rb") as base:
+            output.write(base.read())
+            output.write(b"\n")
+
+        for cert in (ROOT_CERT, SUB_CERT):
+            with open(cert, "rb") as source:
+                output.write(source.read())
+                output.write(b"\n")
+
+    temp_bundle.replace(CA_BUNDLE)
+
+    log.info("CA bundle создан: %s", CA_BUNDLE)
+    return str(CA_BUNDLE)
+
+
+# =========================================================
 # HTTP SESSION
 # =========================================================
 
-session = requests.Session()
+def create_session(ca_bundle):
+    session = requests.Session()
 
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.vtb.ru/",
-    "Origin": "https://www.vtb.ru",
-    "Connection": "keep-alive",
-    "Cache-Control": "no-cache",
-})
+    session.verify = ca_bundle
 
-# Повторяем запросы при временных сетевых ошибках.
-retry_strategy = Retry(
-    total=3,
-    connect=3,
-    read=3,
-    backoff_factor=1,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET", "POST"]),
-    respect_retry_after_header=True,
-)
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": (
+            "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+        ),
+        "Referer": "https://www.vtb.ru/",
+        "Origin": "https://www.vtb.ru",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    })
 
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
+    # Повторы только для GET: не повторяем POST автоматически,
+    # чтобы не отправлять один курс несколько раз при сбое ответа.
+    retry_strategy = Retry(
+        total=3,
+        connect=3,
+        read=2,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        respect_retry_after_header=True,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
+
+
+# =========================================================
+# NORMALIZE VTB TARIFF
+# =========================================================
+
+def normalize_tooltip(value):
+    return " ".join(str(value or "").split()).casefold()
 
 
 # =========================================================
 # FETCH VTB RATE
 # =========================================================
 
-def normalize_tooltip(value):
-    """Нормализует пробелы в названии тарифа."""
-    return " ".join(str(value or "").split()).casefold()
-
-
-def get_yuan_rates():
+def get_yuan_rates(session):
     response = session.get(
         VTB_API_URL,
         timeout=(15, 25),
@@ -112,9 +173,7 @@ def get_yuan_rates():
     items = data.get("rates")
 
     if not isinstance(items, list):
-        raise ValueError(
-            "В ответе ВТБ отсутствует список rates"
-        )
+        raise ValueError("В ответе ВТБ отсутствует список rates")
 
     for item in items:
         if not isinstance(item, dict):
@@ -153,11 +212,12 @@ def get_yuan_rates():
             or offer <= 0
         ):
             raise ValueError(
-                f"ВТБ вернул некорректный курс: bid={bid}, offer={offer}"
+                f"ВТБ вернул некорректный курс: "
+                f"bid={bid}, offer={offer}"
             )
 
         log.info(
-            "Курс ВТБ получен: CNY/RUB, тариф до 500000 ₽, "
+            "Курс ВТБ получен: тариф до 500000 ₽; "
             "bid=%s, offer=%s",
             bid,
             offer,
@@ -169,26 +229,22 @@ def get_yuan_rates():
         }
 
     raise ValueError(
-        "Не найден курс CNY/RUB для тарифа «до 500000.00». "
-        "Возможно, ВТБ изменил формат ответа или название тарифа."
+        "Не найден курс CNY/RUB для тарифа "
+        "'до 500000.00'. Возможно, ВТБ изменил формат ответа."
     )
 
 
 # =========================================================
-# SEND RATE TO EUROPE TELEGRAM BOT
+# SEND RATE TO EUROPE PROJECT
 # =========================================================
 
-def send_rate_to_europe(rates):
+def send_rate_to_europe(session, rates):
     if not EUROPE_API_URL:
         raise RuntimeError("Не задан EUROPE_API_URL")
 
     if not SHARED_SECRET:
-        raise RuntimeError(
-            "Не задан SHARED_SECRET в переменных окружения проекта ВТБ РУ"
-        )
+        raise RuntimeError("Не задан SHARED_SECRET")
 
-    # Время фиксации полученного курса на стороне poller,
-    # а не официальное время обновления курса в ВТБ.
     updated_at = datetime.now().astimezone().strftime(
         "%d.%m.%Y %H:%M:%S"
     )
@@ -211,8 +267,8 @@ def send_rate_to_europe(rates):
     response.raise_for_status()
 
     log.info(
-        "Курс отправлен в Telegram-проект: bid=%s, offer=%s, "
-        "HTTP %s",
+        "Курс отправлен в Telegram-проект: "
+        "bid=%s, offer=%s, HTTP %s",
         rates["bid"],
         rates["offer"],
         response.status_code,
@@ -231,24 +287,27 @@ def main():
 
     if not SHARED_SECRET:
         raise RuntimeError(
-            "Отсутствует SHARED_SECRET. "
-            "Укажи тот же секрет, что и в проекте «ТГ для отправки ЕВРОПА»."
+            "Не задан SHARED_SECRET в переменных окружения проекта ВТБ РУ"
         )
+
+    ca_bundle = build_ca_bundle()
+    session = create_session(ca_bundle)
 
     log.info("VTB poller запускается")
     log.info("Интервал проверки: %s секунд", CHECK_INTERVAL)
     log.info("Адрес приёмника: %s", EUROPE_API_URL)
-    log.info("Проверка SSL включена; truststore активирован")
+    log.info("SSL-проверка включена")
+    log.info("Используется объединённый CA bundle")
 
     while True:
         try:
-            rates = get_yuan_rates()
-            send_rate_to_europe(rates)
+            rates = get_yuan_rates(session)
+            send_rate_to_europe(session, rates)
 
         except requests.exceptions.SSLError:
             log.exception(
                 "Ошибка SSL при обращении к ВТБ или приёмнику. "
-                "Проверь сертификаты в окружении BotHost."
+                "Проверь сертификаты и цепочку TLS."
             )
 
         except requests.exceptions.Timeout:
