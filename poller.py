@@ -1,38 +1,63 @@
+
 import os
 import time
 import logging
+from pathlib import Path
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
+# Важно: подключаем системное хранилище сертификатов ДО requests.
+import truststore
+truststore.inject_into_ssl()
+
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Use the operating system's trusted certificate store when available.
-# TLS certificate verification remains enabled.
-try:
-    import truststore
-    truststore.inject_into_ssl()
-except ImportError:
-    pass
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-VTB_URL = (
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env", override=True)
+
+VTB_API_URL = (
     "https://www.vtb.ru/api/currencyrates/table/optimized"
     "?category=10&type=1&handbook=0"
 )
-BOT_URL = os.getenv("BOTHOST_RATES_URL", "").strip().rstrip("/")
+
+EUROPE_API_URL = os.getenv(
+    "EUROPE_API_URL",
+    "https://bot-1792135903-6908-franterpage.bothost.tech/api/rates",
+).strip()
+
 SHARED_SECRET = os.getenv("SHARED_SECRET", "").strip()
-CHECK_INTERVAL = max(10, int(os.getenv("CHECK_INTERVAL", "30")))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+
+# Тариф ВТБ: до 500 000 рублей.
+TARGET_TOOLTIP = "до 500000.00"
+
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
 )
-log = logging.getLogger("vtb-poller")
+
+log = logging.getLogger(__name__)
+
+
+# =========================================================
+# HTTP SESSION
+# =========================================================
 
 session = requests.Session()
+
 session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -47,98 +72,191 @@ session.headers.update({
     "Cache-Control": "no-cache",
 })
 
+# Повторяем запросы при временных сетевых ошибках.
+retry_strategy = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=1,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),
+    respect_retry_after_header=True,
+)
 
-def validate_config():
-    missing = []
-    if not BOT_URL:
-        missing.append("BOTHOST_RATES_URL")
-    if not SHARED_SECRET:
-        missing.append("SHARED_SECRET")
-    if missing:
-        raise RuntimeError(
-            "Не заданы обязательные переменные окружения: " + ", ".join(missing)
-        )
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+
+# =========================================================
+# FETCH VTB RATE
+# =========================================================
+
+def normalize_tooltip(value):
+    """Нормализует пробелы в названии тарифа."""
+    return " ".join(str(value or "").split()).casefold()
 
 
 def get_yuan_rates():
-    # requests verifies TLS certificates by default.
-    response = session.get(VTB_URL, timeout=(15, 25))
-    response.raise_for_status()
-    data = response.json()
-
-    for item in data.get("rates", []):
-        currency1 = item.get("currency1") or {}
-        currency2 = item.get("currency2") or {}
-        tooltip = " ".join(str(item.get("tooltip", "")).split())
-
-        if (
-            currency1.get("code") == "CNY"
-            and currency2.get("code") == "RUB"
-            and tooltip == "до 500000.00"
-        ):
-            try:
-                bid = Decimal(str(item["bid"]))
-                offer = Decimal(str(item["offer"]))
-            except (KeyError, InvalidOperation) as exc:
-                raise ValueError(
-                    f"В ответе ВТБ отсутствуют корректные bid/offer: {item}"
-                ) from exc
-
-            if (
-                not bid.is_finite()
-                or not offer.is_finite()
-                or bid <= 0
-                or offer <= 0
-            ):
-                raise ValueError(f"Некорректный bid/offer: {bid}/{offer}")
-
-            return {"bid": float(bid), "offer": float(offer)}
-
-    raise ValueError("Не найден CNY/RUB с лимитом до 500000.00")
-
-
-def transmit(rates):
-    payload = {
-        "bid": rates["bid"],
-        "offer": rates["offer"],
-        "updated_at": datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S"),
-    }
-
-    # Must point to the EUROPE project's /api/rates endpoint.
-    response = requests.post(
-        BOT_URL,
-        json=payload,
-        headers={"X-Shared-Secret": SHARED_SECRET},
-        timeout=(10, 20),
+    response = session.get(
+        VTB_API_URL,
+        timeout=(15, 25),
     )
     response.raise_for_status()
 
-    try:
-        return response.json()
-    except ValueError:
-        return {"http_status": response.status_code, "body": response.text[:300]}
+    data = response.json()
 
+    if not isinstance(data, dict):
+        raise ValueError("ВТБ вернул ответ неожиданного формата")
+
+    items = data.get("rates")
+
+    if not isinstance(items, list):
+        raise ValueError(
+            "В ответе ВТБ отсутствует список rates"
+        )
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        currency1 = item.get("currency1") or {}
+        currency2 = item.get("currency2") or {}
+
+        if not isinstance(currency1, dict):
+            continue
+
+        if not isinstance(currency2, dict):
+            continue
+
+        tooltip = normalize_tooltip(item.get("tooltip"))
+
+        if (
+            currency1.get("code") != "CNY"
+            or currency2.get("code") != "RUB"
+            or tooltip != TARGET_TOOLTIP
+        ):
+            continue
+
+        try:
+            bid = Decimal(str(item["bid"]))
+            offer = Decimal(str(item["offer"]))
+        except (KeyError, InvalidOperation, TypeError) as exc:
+            raise ValueError(
+                f"Некорректные значения bid/offer от ВТБ: {item}"
+            ) from exc
+
+        if (
+            not bid.is_finite()
+            or not offer.is_finite()
+            or bid <= 0
+            or offer <= 0
+        ):
+            raise ValueError(
+                f"ВТБ вернул некорректный курс: bid={bid}, offer={offer}"
+            )
+
+        log.info(
+            "Курс ВТБ получен: CNY/RUB, тариф до 500000 ₽, "
+            "bid=%s, offer=%s",
+            bid,
+            offer,
+        )
+
+        return {
+            "bid": bid,
+            "offer": offer,
+        }
+
+    raise ValueError(
+        "Не найден курс CNY/RUB для тарифа «до 500000.00». "
+        "Возможно, ВТБ изменил формат ответа или название тарифа."
+    )
+
+
+# =========================================================
+# SEND RATE TO EUROPE TELEGRAM BOT
+# =========================================================
+
+def send_rate_to_europe(rates):
+    if not EUROPE_API_URL:
+        raise RuntimeError("Не задан EUROPE_API_URL")
+
+    if not SHARED_SECRET:
+        raise RuntimeError(
+            "Не задан SHARED_SECRET в переменных окружения проекта ВТБ РУ"
+        )
+
+    # Время фиксации полученного курса на стороне poller,
+    # а не официальное время обновления курса в ВТБ.
+    updated_at = datetime.now().astimezone().strftime(
+        "%d.%m.%Y %H:%M:%S"
+    )
+
+    payload = {
+        "bid": float(rates["bid"]),
+        "offer": float(rates["offer"]),
+        "updated_at": updated_at,
+    }
+
+    response = session.post(
+        EUROPE_API_URL,
+        json=payload,
+        headers={
+            "X-Shared-Secret": SHARED_SECRET,
+        },
+        timeout=(15, 25),
+    )
+
+    response.raise_for_status()
+
+    log.info(
+        "Курс отправлен в Telegram-проект: bid=%s, offer=%s, "
+        "HTTP %s",
+        rates["bid"],
+        rates["offer"],
+        response.status_code,
+    )
+
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
 
 def main():
-    validate_config()
-    log.info("Опросчик ВТБ запущен; интервал %s сек.", CHECK_INTERVAL)
-    log.info("Адрес передачи курса: %s", BOT_URL)
+    if CHECK_INTERVAL < 5:
+        raise RuntimeError(
+            "CHECK_INTERVAL не должен быть меньше 5 секунд"
+        )
+
+    if not SHARED_SECRET:
+        raise RuntimeError(
+            "Отсутствует SHARED_SECRET. "
+            "Укажи тот же секрет, что и в проекте «ТГ для отправки ЕВРОПА»."
+        )
+
+    log.info("VTB poller запускается")
+    log.info("Интервал проверки: %s секунд", CHECK_INTERVAL)
+    log.info("Адрес приёмника: %s", EUROPE_API_URL)
+    log.info("Проверка SSL включена; truststore активирован")
 
     while True:
         try:
             rates = get_yuan_rates()
-            result = transmit(rates)
-            log.info(
-                "Курс получен и передан: bid=%.4f offer=%.4f; ответ BotHost=%s",
-                rates["bid"], rates["offer"], result,
-            )
+            send_rate_to_europe(rates)
+
         except requests.exceptions.SSLError:
             log.exception(
-                "Ошибка SSL-сертификата ВТБ. Проверьте системные корневые "
-                "сертификаты/CA bundle на сервере. Не отключайте TLS-проверку."
+                "Ошибка SSL при обращении к ВТБ или приёмнику. "
+                "Проверь сертификаты в окружении BotHost."
             )
+
+        except requests.exceptions.Timeout:
+            log.exception("Истекло время ожидания HTTP-запроса")
+
         except requests.exceptions.RequestException:
-            log.exception("Сетевая ошибка при получении или передаче курса")
+            log.exception("Ошибка HTTP-запроса")
+
         except Exception:
             log.exception("Ошибка получения или передачи курса")
 
